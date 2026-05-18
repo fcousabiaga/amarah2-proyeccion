@@ -356,19 +356,20 @@ function calcEngine(p, ventasMes) {
   let totalCancelados=0;
 
   // Pre-calcular cancelaciones ANTES del loop de flujo
-  // Las cancelaciones solo ocurren durante el periodo de ventas.
-  // Máximo cancelable: no más del 30% del total vendido y no más de mesesVenta cancelaciones.
   const maxCancelTotal = Math.floor(totalResid * 0.30);
+  const cancelPorMesArr = new Array(HORIZON+200).fill(0); // cancelaciones por mes
+  const reventaPorMesArr = new Array(HORIZON+200).fill(0); // reventas por mes
+
   for(let mes=cancelInicio; mes<=mesesVenta && totalCancelados<maxCancelTotal; mes++){
-    // Estimamos lotes vendidos en este mes (mismo cálculo que el loop de ventas)
-    const vendEstim = Math.min(ventasMes, Math.max(0, totalResid - Math.min(ventasMes*(mes-1), totalResid)));
     const acumEstim = Math.min(ventasMes*mes, totalResid);
     if(acumEstim <= 0) break;
     const cancelEste = Math.min(cancelPorMes, maxCancelTotal-totalCancelados);
     totalCancelados += cancelEste;
     if(cancelEste <= 0) continue;
 
-    // Lote cancelado → ingreso de reventa al mes siguiente
+    cancelPorMesArr[mes] = cancelEste;
+    reventaPorMesArr[mes+1] = (reventaPorMesArr[mes+1]||0) + cancelEste; // reventa al mes siguiente
+
     const clusterFrac = Math.min(acumEstim/totalResid, 0.999);
     const clIdx = Math.min(Math.floor(clusterFrac*p.numClusters), p.numClusters-1);
     const pcM2 = precioCluster[clIdx]||precioCluster[0];
@@ -378,9 +379,7 @@ function calcEngine(p, ventasMes) {
     const plazoPromPonderado = Math.max(Math.round(plazoDist.reduce((a,pl)=>a+pl.w*pl.meses,0)),12);
     const cuotaReventa = (restoReventa/plazoPromPonderado)*efectividad;
 
-    // Enganche de reventa: mes+1
     if(mes+1 < arrEng.length) arrEng[mes+1] += cancelEste * engReventa;
-    // Mensualidades de reventa: mes+2 en adelante
     for(let dm=1; dm<=plazoPromPonderado; dm++){
       const t = mes+1+dm;
       if(t < arrMens.length) arrMens[t] += cancelEste * cuotaReventa;
@@ -427,11 +426,21 @@ function calcEngine(p, ventasMes) {
       saldo-=utilidadMes;
     }
 
+    const cancelEstesMes = cancelPorMesArr[mes]||0;
+    const reventaEsteMes = reventaPorMesArr[mes]||0;
+    const vendidosMesTotal = vendidosMes + reventaEsteMes;
+    const flujoNetoMes = ingresosBrutos - totalGastosMes; // lo que entró menos lo que salió
+
     flujoMensual.push({
-      mes, vendidosMes, vendResidMes:vr, vendComercMes:vc,
-      cancelMes: (mes>=cancelInicio && mes<=mesesVenta) ? Math.min(cancelPorMes, Math.max(0, maxCancelTotal)) : 0,
-      lotesResidVendidos:rvAcum, lotesComercVendidos:cvAcum,
+      mes,
+      vendidosMes: vendidosMesTotal,   // incluye reventas
+      vendResidMes:vr, vendComercMes:vc,
+      cancelMes: cancelEstesMes,
+      reventaMes: reventaEsteMes,
+      lotesResidVendidos: rvAcum + reventaEsteMes, // acum incluye reventas
+      lotesComercVendidos:cvAcum,
       engancheMes, mensualidadesMes, ingresosBrutos, costoFin, ingresoNeto,
+      flujoNetoMes,                    // ingreso - gasto del mes
       ...gastosPartida, comisionMes, retencion:p.retencionMensual,
       totalGastosMes, utilidadMes, saldo,
       alertaObra,
@@ -738,12 +747,13 @@ const FlowChart = React.memo(function FlowChart({flujo, partidas, mesFinVentas, 
 function exportarExcel(flujo, partidas, params, label, result) {
   // Construir CSV con todos los datos
   const cols = [
-    "Mes","Lotes Vendidos (mes)","Lotes Acum.",
+    "Mes","Lotes Vendidos (mes)","Lotes Acum.","Cancelaciones (mes)","Reventas (mes)",
     "Enganche","Mensualidades","Total Ingresos","Costo Financiero","Ingreso Neto",
     ...partidas.flatMap(pt=>[pt.label+" (mes)", pt.label+" (acum)", pt.label+" % ppto"]),
     "Comisiones (mes)","Comisiones (acum)",
     "Retenciones","Total Gastos",
-    "Utilidad (mes)","Utilidad (acum)","Saldo"
+    "Flujo Neto del Mes","Saldo Acumulado",
+    "Utilidad (mes)","Utilidad (acum)"
   ];
 
   // Pre-calcular acumulados
@@ -751,12 +761,18 @@ function exportarExcel(flujo, partidas, params, label, result) {
   for(const pt of partidas) acumRun[pt.id]=0;
   acumRun.com=0; acumRun.util=0;
 
+  let saldoAcum = 0;
   const rows = flujo.map(f => {
     for(const pt of partidas) acumRun[pt.id]+=(f[pt.id]||0);
     acumRun.com+=f.comisionMes;
     acumRun.util+=f.utilidadMes;
+    saldoAcum += f.flujoNetoMes||0;
     return [
-      f.mes, f.vendidosMes, f.lotesResidVendidos+(f.lotesComercVendidos||0),
+      f.mes,
+      f.vendidosMes,
+      f.lotesResidVendidos+(f.lotesComercVendidos||0),
+      f.cancelMes||0,
+      f.reventaMes||0,
       Math.round(f.engancheMes), Math.round(f.mensualidadesMes),
       Math.round(f.ingresosBrutos), Math.round(f.costoFin), Math.round(f.ingresoNeto),
       ...partidas.flatMap(pt=>[
@@ -766,8 +782,8 @@ function exportarExcel(flujo, partidas, params, label, result) {
       ]),
       Math.round(f.comisionMes), Math.round(acumRun.com),
       Math.round(f.retencion), Math.round(f.totalGastosMes),
-      Math.round(f.utilidadMes), Math.round(acumRun.util),
-      Math.round(f.saldo)
+      Math.round(f.flujoNetoMes||0), Math.round(saldoAcum),
+      Math.round(f.utilidadMes), Math.round(acumRun.util)
     ];
   });
 
