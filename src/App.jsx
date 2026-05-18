@@ -630,114 +630,116 @@ function FlowChart({flujo, partidas, mesFinVentas, mesFinCobros, mesInicioUtil, 
 // ─── TABLA FLUJO ──────────────────────────────────────────────────────────────
 function FlowTable({flujo,partidas}){
   const [page,setPage]=useState(0);
-  const perPage=18;
+  const [vista,setVista]=useState("resumen"); // "resumen" | id de partida
+  const perPage=24;
   const pages=Math.ceil(flujo.length/perPage);
+
+  // Pre-calcular acumulados para todo el flujo una sola vez
+  const acumTotal=useMemo(()=>{
+    const acc={};
+    for(const pt of partidas) acc[pt.id]=[];
+    acc.comisionMes=[]; acc.utilidadMes=[];
+    let runPt={},runCom=0,runUtil=0;
+    for(const pt of partidas) runPt[pt.id]=0;
+    for(const f of flujo){
+      for(const pt of partidas){ runPt[pt.id]+=(f[pt.id]||0); acc[pt.id].push(runPt[pt.id]); }
+      runCom+=f.comisionMes; acc.comisionMes.push(runCom);
+      runUtil+=f.utilidadMes; acc.utilidadMes.push(runUtil);
+    }
+    return acc;
+  },[flujo,partidas]);
+
   const rows=flujo.slice(page*perPage,page*perPage+perPage);
+  const startIdx=page*perPage;
 
-  // Acumulados
-  const acum={};
-  const totBudget={};
-  for(const pt of partidas){acum[pt.id]=0;totBudget[pt.id]=pt.total;}
-  acum.comisionMes=0; acum.utilidadMes=0; acum.saldo=0;
-
-  const allRows=flujo.slice(0,(page+1)*perPage);
-  for(const f of allRows){
-    for(const pt of partidas) acum[pt.id]+=f[pt.id]||0;
-    acum.comisionMes+=f.comisionMes;
-    acum.utilidadMes+=f.utilidadMes;
-  }
-
-  // Per-row acumulados up to start of page
-  const acumAtPageStart={};
-  for(const pt of partidas) acumAtPageStart[pt.id]=0;
-  acumAtPageStart.comisionMes=0; acumAtPageStart.utilidadMes=0;
-  for(const f of flujo.slice(0,page*perPage)){
-    for(const pt of partidas) acumAtPageStart[pt.id]+=f[pt.id]||0;
-    acumAtPageStart.comisionMes+=f.comisionMes;
-    acumAtPageStart.utilidadMes+=f.utilidadMes;
-  }
-
-  const th=(c=G.textMuted)=>({padding:"4px 6px",fontSize:9,textAlign:"right",background:G.surfaceLight,
+  const th=(c=G.textMuted)=>({padding:"5px 7px",fontSize:9,textAlign:"right",background:G.surfaceLight,
     color:c,fontWeight:700,letterSpacing:".05em",textTransform:"uppercase",whiteSpace:"nowrap",
     fontFamily:"'IBM Plex Mono',monospace"});
-  const td=(c=G.text,fw=400)=>({padding:"3px 6px",fontSize:9,textAlign:"right",color:c,fontWeight:fw,
+  const td=(c=G.text,fw=400)=>({padding:"4px 7px",fontSize:10,textAlign:"right",color:c,fontWeight:fw,
     fontFamily:"'IBM Plex Mono',monospace",borderBottom:`1px solid ${G.border}10`,whiteSpace:"nowrap"});
 
-  // Track row-level acum
-  const rowAcum={};
-  for(const pt of partidas) rowAcum[pt.id]=acumAtPageStart[pt.id];
-  rowAcum.comisionMes=acumAtPageStart.comisionMes;
-  rowAcum.utilidadMes=acumAtPageStart.utilidadMes;
+  const partSeleccionada=partidas.find(p=>p.id===vista);
 
   return(
     <div>
-      <div style={{overflowX:"auto",fontSize:10}}>
-        <table style={{width:"100%",borderCollapse:"collapse"}}>
-          <thead>
-            <tr>
+      {/* Selector de vista */}
+      <div style={{display:"flex",gap:6,marginBottom:10,flexWrap:"wrap"}}>
+        <button onClick={()=>{setVista("resumen");setPage(0);}} style={{
+          padding:"4px 10px",borderRadius:5,fontSize:10,fontWeight:700,
+          border:`1px solid ${vista==="resumen"?G.accent:G.border}`,
+          background:vista==="resumen"?G.accentDim:"transparent",
+          color:vista==="resumen"?G.accent:G.textMuted,
+        }}>Resumen general</button>
+        {partidas.map(pt=>(
+          <button key={pt.id} onClick={()=>{setVista(pt.id);setPage(0);}} style={{
+            padding:"4px 10px",borderRadius:5,fontSize:10,fontWeight:700,
+            border:`1px solid ${vista===pt.id?pt.color:G.border}`,
+            background:vista===pt.id?`${pt.color}20`:"transparent",
+            color:vista===pt.id?pt.color:G.textMuted,
+          }}>{pt.label.slice(0,12)}</button>
+        ))}
+      </div>
+
+      <div style={{overflowX:"auto"}}>
+        {vista==="resumen"?(
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr>
               <th style={th()}>Mes</th>
+              <th style={th()}>Vend.</th>
               <th style={th(G.accent)}>Enganche</th>
               <th style={th(G.purple)}>Mensual.</th>
-              <th style={th()}>T.Ing.</th>
-              {partidas.map(pt=>(
-                <th key={pt.id} colSpan={3} style={{...th(pt.color),textAlign:"center",borderLeft:`1px solid ${G.border}`}}>
-                  {pt.label.slice(0,9)}
-                </th>
-              ))}
-              <th colSpan={3} style={{...th(G.textDim),textAlign:"center",borderLeft:`1px solid ${G.border}`}}>Comisiones</th>
-              <th style={th(G.red)}>T.Gasto</th>
-              <th colSpan={3} style={{...th(G.gold),textAlign:"center",borderLeft:`1px solid ${G.border}`}}>Utilidad</th>
-              <th style={th(G.accent)}>Saldo</th>
-            </tr>
-            <tr>
-              <th style={th()}></th>
-              <th style={th(G.accent)}></th>
-              <th style={th(G.purple)}></th>
-              <th style={th()}></th>
-              {partidas.map(pt=>["Mes","Acum","%Ppto"].map(h=>(
-                <th key={pt.id+h} style={{...th(G.textMuted),borderLeft:h==="Mes"?`1px solid ${G.border}`:undefined}}>{h}</th>
-              )))}
-              {["Mes","Acum","%Ppto"].map(h=><th key={h} style={{...th(G.textMuted),borderLeft:h==="Mes"?`1px solid ${G.border}`:undefined}}>{h}</th>)}
-              <th style={th(G.red)}></th>
-              {["Mes","Acum",""].map(h=><th key={h} style={{...th(G.gold),borderLeft:h==="Mes"?`1px solid ${G.border}`:undefined}}>{h}</th>)}
-              <th style={th(G.accent)}></th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((f,ri)=>{
-              const rowSnap={};
-              for(const pt of partidas){
-                rowSnap[pt.id]={mes:f[pt.id]||0, acum:rowAcum[pt.id]+(f[pt.id]||0), ppt:((rowAcum[pt.id]+(f[pt.id]||0))/pt.total)*100};
-                rowAcum[pt.id]+=(f[pt.id]||0);
-              }
-              rowSnap.com={mes:f.comisionMes,acum:rowAcum.comisionMes+f.comisionMes,ppt:0};
-              rowAcum.comisionMes+=f.comisionMes;
-              rowSnap.util={mes:f.utilidadMes,acum:rowAcum.utilidadMes+f.utilidadMes};
-              rowAcum.utilidadMes+=f.utilidadMes;
-              return(
+              <th style={th()}>T.Ingresos</th>
+              <th style={th(G.red)}>T.Gastos</th>
+              <th style={th(G.gold)}>Utilidad</th>
+              <th style={th(G.blue)}>Saldo</th>
+            </tr></thead>
+            <tbody>
+              {rows.map((f,ri)=>(
                 <tr key={f.mes} style={{background:ri%2===0?`${G.surfaceLight}30`:"transparent"}}>
                   <td style={td(G.textMuted,600)}>{f.mes}</td>
+                  <td style={td(G.accent)}>{f.vendidosMes}</td>
                   <td style={td(G.accent)}>{fmtMM(f.engancheMes)}</td>
                   <td style={td(G.purple)}>{fmtMM(f.mensualidadesMes)}</td>
-                  <td style={td()}>{fmtMM(f.ingresosBrutos)}</td>
-                  {partidas.map(pt=>[
-                    <td key={pt.id+"m"} style={{...td(G.textDim),borderLeft:`1px solid ${G.border}10`}}>{fmtMM(rowSnap[pt.id].mes)}</td>,
-                    <td key={pt.id+"a"} style={td(pt.color)}>{fmtMM(rowSnap[pt.id].acum)}</td>,
-                    <td key={pt.id+"p"} style={td(rowSnap[pt.id].ppt>100?G.red:G.textMuted)}>{fmt(rowSnap[pt.id].ppt,0)}%</td>,
-                  ])}
-                  <td style={{...td(G.textDim),borderLeft:`1px solid ${G.border}10`}}>{fmtMM(rowSnap.com.mes)}</td>
-                  <td style={td(G.textDim)}>{fmtMM(rowSnap.com.acum)}</td>
-                  <td style={td(G.textMuted)}>—</td>
+                  <td style={td(G.text,600)}>{fmtMM(f.ingresosBrutos)}</td>
                   <td style={td(G.red)}>{fmtMM(f.totalGastosMes)}</td>
-                  <td style={{...td(f.utilidadMes>0?G.gold:G.textMuted),borderLeft:`1px solid ${G.border}10`}}>{fmtMM(rowSnap.util.mes)}</td>
-                  <td style={td(G.gold)}>{fmtMM(rowSnap.util.acum)}</td>
-                  <td style={td(G.textMuted)}>—</td>
+                  <td style={td(f.utilidadMes>0?G.gold:G.textMuted)}>{fmtMM(f.utilidadMes)}</td>
                   <td style={{...td(f.saldo>=0?G.accent:G.red),fontWeight:600}}>{fmtMM(f.saldo)}</td>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
+              ))}
+            </tbody>
+          </table>
+        ):(
+          partSeleccionada&&(
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead><tr>
+                <th style={th()}>Mes</th>
+                <th style={th(partSeleccionada.color)}>Gasto mes</th>
+                <th style={th(partSeleccionada.color)}>Acumulado</th>
+                <th style={th(G.textMuted)}>% Presupuesto</th>
+                <th style={th(G.textMuted)}>Restante</th>
+                <th style={th()}>Saldo proyecto</th>
+              </tr></thead>
+              <tbody>
+                {rows.map((f,ri)=>{
+                  const idx=startIdx+ri;
+                  const acumVal=acumTotal[partSeleccionada.id][idx]||0;
+                  const pptVal=(acumVal/partSeleccionada.total)*100;
+                  const restante=partSeleccionada.total-acumVal;
+                  return(
+                    <tr key={f.mes} style={{background:ri%2===0?`${G.surfaceLight}30`:"transparent"}}>
+                      <td style={td(G.textMuted,600)}>{f.mes}</td>
+                      <td style={td(partSeleccionada.color)}>{fmtMM(f[partSeleccionada.id]||0)}</td>
+                      <td style={td(partSeleccionada.color,600)}>{fmtMM(acumVal)}</td>
+                      <td style={td(pptVal>100?G.red:G.textMuted)}>{fmt(pptVal,1)}%</td>
+                      <td style={td(restante<0?G.red:G.textDim)}>{fmtMM(restante)}</td>
+                      <td style={{...td(f.saldo>=0?G.accent:G.red),fontWeight:600}}>{fmtMM(f.saldo)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )
+        )}
       </div>
       {pages>1&&(
         <div style={{display:"flex",gap:5,marginTop:8,justifyContent:"center",flexWrap:"wrap"}}>
@@ -1428,47 +1430,34 @@ function ScenarioView({label,color,params,ventasMes,onChangeVentas,result}){
               }}>C{i+1} · {fmtM(pc)}/m²</button>
             ))}
           </div>
-
-          {/* Tabla plazo × precio × mensualidad para el cluster seleccionado */}
           <div style={{overflowX:"auto"}}>
             <table style={{width:"100%",borderCollapse:"collapse",fontFamily:"'IBM Plex Mono',monospace",fontSize:11}}>
               <thead>
                 <tr>
-                  <th style={{padding:"6px 10px",background:G.surfaceLight,color:G.textMuted,fontSize:9,
-                    textAlign:"left",letterSpacing:".06em",textTransform:"uppercase"}}>Plazo</th>
+                  <th style={{padding:"6px 10px",background:G.surfaceLight,color:G.textMuted,fontSize:9,textAlign:"left",letterSpacing:".06em",textTransform:"uppercase"}}>Plazo</th>
                   <th style={{padding:"6px 10px",background:G.surfaceLight,color:G.textMuted,fontSize:9,textAlign:"right"}}>Delta</th>
-                  <th style={{padding:"6px 10px",background:G.surfaceLight,color:color,fontSize:9,textAlign:"right"}}>Precio m²</th>
-                  <th style={{padding:"6px 10px",background:G.surfaceLight,color:G.text,fontSize:9,textAlign:"right"}}>Precio total lote</th>
+                  <th style={{padding:"6px 10px",background:G.surfaceLight,color,fontSize:9,textAlign:"right"}}>Precio m²</th>
+                  <th style={{padding:"6px 10px",background:G.surfaceLight,color:G.text,fontSize:9,textAlign:"right"}}>Total lote</th>
                   <th style={{padding:"6px 10px",background:G.surfaceLight,color:G.accent,fontSize:9,textAlign:"right"}}>Enganche</th>
                   <th style={{padding:"6px 10px",background:G.surfaceLight,color:G.purple,fontSize:9,textAlign:"right"}}>Mensualidad</th>
                 </tr>
               </thead>
               <tbody>
                 {result.plazos.map((pl,pi)=>{
-                  const pc    = result.precioCluster[clusterVista]||0;
-                  const m2    = result.m2PorLote;
-                  const precM2= pc*pl.factor;
-                  const total = precM2*m2;
-                  const eng   = total*(params.pctEnganche/100);
-                  const resto = total-eng;
-                  const mens  = pl.meses>0?resto/pl.meses:0;
-                  const isBase= pl.meses===params.plazoBase;
+                  const pc=result.precioCluster[clusterVista]||0;
+                  const precM2=pc*pl.factor;
+                  const total=precM2*result.m2PorLote;
+                  const eng=total*(params.pctEnganche/100);
+                  const mens=pl.meses>0?(total-eng)/pl.meses:0;
+                  const isBase=pl.meses===params.plazoBase;
                   return(
-                    <tr key={pi} style={{background:isBase?G.goldDim:pi%2===0?`${G.surfaceLight}40`:"transparent",
-                      border:isBase?`1px solid ${G.gold}30`:"none"}}>
-                      <td style={{padding:"6px 10px",color:isBase?G.gold:G.textDim,fontWeight:isBase?700:400}}>
-                        {pl.label}{isBase?" ★ BASE":""}
-                      </td>
-                      <td style={{padding:"6px 10px",textAlign:"right",
-                        color:pl.delta>0?G.accent:pl.delta<0?G.red:G.textMuted}}>
-                        {pl.delta>0?"+":""}{pl.delta}%
-                      </td>
+                    <tr key={pi} style={{background:isBase?G.goldDim:pi%2===0?`${G.surfaceLight}40`:"transparent"}}>
+                      <td style={{padding:"6px 10px",color:isBase?G.gold:G.textDim,fontWeight:isBase?700:400}}>{pl.label}{isBase?" ★":""}</td>
+                      <td style={{padding:"6px 10px",textAlign:"right",color:pl.delta>0?G.accent:pl.delta<0?G.red:G.textMuted}}>{pl.delta>0?"+":""}{pl.delta}%</td>
                       <td style={{padding:"6px 10px",textAlign:"right",color,fontWeight:600}}>{fmtM(precM2)}</td>
                       <td style={{padding:"6px 10px",textAlign:"right",color:G.text}}>{fmtMM(total)}</td>
                       <td style={{padding:"6px 10px",textAlign:"right",color:G.accent}}>{fmtMM(eng)}</td>
-                      <td style={{padding:"6px 10px",textAlign:"right",color:pl.meses>0?G.purple:G.textMuted}}>
-                        {pl.meses>0?fmtMM(mens):"CONTADO"}
-                      </td>
+                      <td style={{padding:"6px 10px",textAlign:"right",color:pl.meses>0?G.purple:G.textMuted}}>{pl.meses>0?fmtMM(mens):"CONTADO"}</td>
                     </tr>
                   );
                 })}
