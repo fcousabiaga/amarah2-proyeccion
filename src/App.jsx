@@ -353,46 +353,54 @@ function calcEngine(p, ventasMes) {
   let saldo=0, mesInicioUtil=null, utilBase=null;
   const flujoMensual=[];
   let rvAcum=0, cvAcum=0;
-  let lotesRevendidos=0, totalCancelados=0;
+  let totalCancelados=0;
 
-  for(let mes=1;mes<=Math.min(HORIZON,mesFinCobros+3);mes++){
-    // Ventas regulares
-    const residDisp2=totalResid-rvAcum+lotesRevendidos;
+  // Pre-calcular cancelaciones ANTES del loop de flujo
+  // Las cancelaciones solo ocurren durante el periodo de ventas.
+  // Máximo cancelable: no más del 30% del total vendido y no más de mesesVenta cancelaciones.
+  const maxCancelTotal = Math.floor(totalResid * 0.30);
+  for(let mes=cancelInicio; mes<=mesesVenta && totalCancelados<maxCancelTotal; mes++){
+    // Estimamos lotes vendidos en este mes (mismo cálculo que el loop de ventas)
+    const vendEstim = Math.min(ventasMes, Math.max(0, totalResid - Math.min(ventasMes*(mes-1), totalResid)));
+    const acumEstim = Math.min(ventasMes*mes, totalResid);
+    if(acumEstim <= 0) break;
+    const cancelEste = Math.min(cancelPorMes, maxCancelTotal-totalCancelados);
+    totalCancelados += cancelEste;
+    if(cancelEste <= 0) continue;
+
+    // Lote cancelado → ingreso de reventa al mes siguiente
+    const clusterFrac = Math.min(acumEstim/totalResid, 0.999);
+    const clIdx = Math.min(Math.floor(clusterFrac*p.numClusters), p.numClusters-1);
+    const pcM2 = precioCluster[clIdx]||precioCluster[0];
+    const precioReventa = pcM2 * m2PorLote * plazoDist.reduce((a,pl)=>a+pl.w*pl.factor,0);
+    const engReventa = precioReventa * (p.pctEnganche/100);
+    const restoReventa = precioReventa - engReventa;
+    const plazoPromPonderado = Math.max(Math.round(plazoDist.reduce((a,pl)=>a+pl.w*pl.meses,0)),12);
+    const cuotaReventa = (restoReventa/plazoPromPonderado)*efectividad;
+
+    // Enganche de reventa: mes+1
+    if(mes+1 < arrEng.length) arrEng[mes+1] += cancelEste * engReventa;
+    // Mensualidades de reventa: mes+2 en adelante
+    for(let dm=1; dm<=plazoPromPonderado; dm++){
+      const t = mes+1+dm;
+      if(t < arrMens.length) arrMens[t] += cancelEste * cuotaReventa;
+    }
+  }
+
+  // Re-detectar fin de cobros después de agregar reventas
+  mesFinCobros = HORIZON;
+  for(let m=HORIZON+199;m>mesesVenta;m--){
+    if((arrEng[m]||0)+(arrMens[m]||0)>1){ mesFinCobros=m; break; }
+  }
+
+  for(let mes=1;mes<=Math.min(HORIZON,mesFinCobros+2);mes++){
+    // Ventas regulares — solo cuentan los lotes del inventario original
     const vr=Math.min(ventasMes,Math.max(0,totalResid-rvAcum));
     const pctRV=(rvAcum/totalResid)*100;
     const pC=pctRV>=p.pctInicioComerciales;
     const vc=pC?Math.min(Math.ceil(ventasMes*0.3),Math.max(0,p.numLotesComerciales-cvAcum)):0;
     rvAcum+=vr; cvAcum+=vc;
-    const vendidosMesBase=vr+vc;
-
-    // Cancelaciones a partir del mes de inicio
-    let cancelMes=0, ingresosReventa=0;
-    if(mes>=cancelInicio && rvAcum>0){
-      cancelMes = Math.min(cancelPorMes, Math.max(0, rvAcum-totalCancelados-10));
-      totalCancelados += cancelMes;
-      // Los lotes cancelados vuelven al inventario (reventa inmediata siguiente mes)
-      // Modelamos: reventa genera enganche y nuevas mensualidades
-      if(cancelMes>0){
-        const clusterFrac = Math.min(rvAcum/totalResid, 0.999);
-        const clIdx = Math.min(Math.floor(clusterFrac*p.numClusters), p.numClusters-1);
-        const pcM2 = precioCluster[clIdx]||precioCluster[0];
-        // Plazo promedio ponderado para reventa
-        const precioReventa = pcM2 * m2PorLote * plazoDist.reduce((a,pl)=>a+pl.w*pl.factor,0);
-        const engReventa = precioReventa * (p.pctEnganche/100);
-        // Enganche de reventa llega al mes siguiente
-        if(mes+1<arrEng.length) arrEng[mes+1] += cancelMes * engReventa;
-        // Mensualidades de reventa (distribuidas)
-        const restoReventa = precioReventa - engReventa;
-        const plazoPromPonderado = plazoDist.reduce((a,pl)=>a+pl.w*pl.meses,0);
-        const mesesReventa = Math.max(Math.round(plazoPromPonderado),12);
-        const cuotaReventa = (restoReventa/mesesReventa)*efectividad;
-        for(let dm=1;dm<=mesesReventa;dm++){
-          const t=mes+1+dm;
-          if(t<arrMens.length) arrMens[t]+=cancelMes*cuotaReventa;
-        }
-        lotesRevendidos+=cancelMes;
-      }
-    }
+    const vendidosMes=vr+vc; // cancelaciones NO se reportan como ventas del mes
 
     const engancheMes    = arrEng[mes]||0;
     const mensualidadesMes = arrMens[mes]||0;
@@ -420,8 +428,8 @@ function calcEngine(p, ventasMes) {
     }
 
     flujoMensual.push({
-      mes, vendidosMes:vendidosMesBase+cancelMes, vendResidMes:vr, vendComercMes:vc,
-      cancelMes, lotesRevendidos,
+      mes, vendidosMes, vendResidMes:vr, vendComercMes:vc,
+      cancelMes: (mes>=cancelInicio && mes<=mesesVenta) ? Math.min(cancelPorMes, Math.max(0, maxCancelTotal)) : 0,
       lotesResidVendidos:rvAcum, lotesComercVendidos:cvAcum,
       engancheMes, mensualidadesMes, ingresosBrutos, costoFin, ingresoNeto,
       ...gastosPartida, comisionMes, retencion:p.retencionMensual,
