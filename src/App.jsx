@@ -138,6 +138,10 @@ const DEF = {
   reservaMinima:3,
   utilBaseMultiplier:0.015,
   utilGrowthRate:1.15,
+  // Efectividad de cobro y cancelaciones
+  efectividadCobro:85,        // % de mensualidades que efectivamente se cobran
+  mesCancelacionInicio:6,     // mes a partir del cual empiezan cancelaciones
+  cancelacionesPorMes:2,      // lotes cancelados por mes (vuelven al inventario)
   partidas: buildPartidas(8),
 };
 
@@ -324,6 +328,21 @@ function calcEngine(p, ventasMes) {
     }
   }
 
+  // Aplicar efectividad de cobro a mensualidades (morosidad)
+  const efectividad = (p.efectividadCobro||85) / 100;
+  for(let m=0;m<arrMens.length;m++) arrMens[m] *= efectividad;
+
+  // Modelar cancelaciones: a partir de mesCancelacionInicio, X lotes/mes cancelan.
+  // El lote cancelado pierde sus mensualidades futuras pero el lote vuelve al inventario
+  // y se revende al precio del cluster vigente ese mes.
+  const cancelInicio = p.mesCancelacionInicio || 6;
+  const cancelPorMes = p.cancelacionesPorMes || 2;
+
+  // Para cada mes con cancelaciones, reducimos arrMens futuros proporcional a los lotes
+  // cancelados vs la cartera activa estimada, y añadimos la reventa como nueva venta.
+  // Estimamos cartera activa = lotes vendidos con crédito activo (aprox).
+  let lotesEnCarteraEstim = 0;
+
   // Detectar fin de cobros
   let mesFinCobros = HORIZON;
   for(let m=HORIZON+199;m>mesesVenta;m--){
@@ -333,15 +352,47 @@ function calcEngine(p, ventasMes) {
   // Construir flujoMensual
   let saldo=0, mesInicioUtil=null, utilBase=null;
   const flujoMensual=[];
-  // Reconstruir vendidos por mes para el array
   let rvAcum=0, cvAcum=0;
+  let lotesRevendidos=0, totalCancelados=0;
+
   for(let mes=1;mes<=Math.min(HORIZON,mesFinCobros+3);mes++){
-    const residDisp2=totalResid-rvAcum;
-    const vr=Math.min(ventasMes,Math.max(0,residDisp2));
+    // Ventas regulares
+    const residDisp2=totalResid-rvAcum+lotesRevendidos;
+    const vr=Math.min(ventasMes,Math.max(0,totalResid-rvAcum));
     const pctRV=(rvAcum/totalResid)*100;
     const pC=pctRV>=p.pctInicioComerciales;
     const vc=pC?Math.min(Math.ceil(ventasMes*0.3),Math.max(0,p.numLotesComerciales-cvAcum)):0;
     rvAcum+=vr; cvAcum+=vc;
+    const vendidosMesBase=vr+vc;
+
+    // Cancelaciones a partir del mes de inicio
+    let cancelMes=0, ingresosReventa=0;
+    if(mes>=cancelInicio && rvAcum>0){
+      cancelMes = Math.min(cancelPorMes, Math.max(0, rvAcum-totalCancelados-10));
+      totalCancelados += cancelMes;
+      // Los lotes cancelados vuelven al inventario (reventa inmediata siguiente mes)
+      // Modelamos: reventa genera enganche y nuevas mensualidades
+      if(cancelMes>0){
+        const clusterFrac = Math.min(rvAcum/totalResid, 0.999);
+        const clIdx = Math.min(Math.floor(clusterFrac*p.numClusters), p.numClusters-1);
+        const pcM2 = precioCluster[clIdx]||precioCluster[0];
+        // Plazo promedio ponderado para reventa
+        const precioReventa = pcM2 * m2PorLote * plazoDist.reduce((a,pl)=>a+pl.w*pl.factor,0);
+        const engReventa = precioReventa * (p.pctEnganche/100);
+        // Enganche de reventa llega al mes siguiente
+        if(mes+1<arrEng.length) arrEng[mes+1] += cancelMes * engReventa;
+        // Mensualidades de reventa (distribuidas)
+        const restoReventa = precioReventa - engReventa;
+        const plazoPromPonderado = plazoDist.reduce((a,pl)=>a+pl.w*pl.meses,0);
+        const mesesReventa = Math.max(Math.round(plazoPromPonderado),12);
+        const cuotaReventa = (restoReventa/mesesReventa)*efectividad;
+        for(let dm=1;dm<=mesesReventa;dm++){
+          const t=mes+1+dm;
+          if(t<arrMens.length) arrMens[t]+=cancelMes*cuotaReventa;
+        }
+        lotesRevendidos+=cancelMes;
+      }
+    }
 
     const engancheMes    = arrEng[mes]||0;
     const mensualidadesMes = arrMens[mes]||0;
@@ -354,6 +405,8 @@ function calcEngine(p, ventasMes) {
     for(const part of p.partidas) gastosPartida[part.id]=gastoMes[part.id][mes-1]||0;
     const totalPartidas  = Object.values(gastosPartida).reduce((a,b)=>a+b,0);
     const totalGastosMes = totalPartidas+comisionMes+p.retencionMensual+costoFin;
+    const gastoUrbanizacionMes = gastosPartida["urbanizacion"]||0;
+    const alertaObra = saldo < gastoUrbanizacionMes && gastoUrbanizacionMes > 0;
 
     saldo = saldo+ingresoNeto-totalPartidas-comisionMes-p.retencionMensual;
 
@@ -367,11 +420,13 @@ function calcEngine(p, ventasMes) {
     }
 
     flujoMensual.push({
-      mes, vendidosMes:vr+vc, vendResidMes:vr, vendComercMes:vc,
+      mes, vendidosMes:vendidosMesBase+cancelMes, vendResidMes:vr, vendComercMes:vc,
+      cancelMes, lotesRevendidos,
       lotesResidVendidos:rvAcum, lotesComercVendidos:cvAcum,
       engancheMes, mensualidadesMes, ingresosBrutos, costoFin, ingresoNeto,
       ...gastosPartida, comisionMes, retencion:p.retencionMensual,
       totalGastosMes, utilidadMes, saldo,
+      alertaObra,
     });
   }
 
@@ -873,6 +928,13 @@ function GastosPanel({params,setParams,nBloques}){
                 <div style={{display:"grid",gap:7}}>
                   {part.bloques.map((blq,bi)=>{
                     const montoBlq=part.total*(blq.pct/100);
+                    const montoMes=montoBlq/6;
+                    // Suma de todas las partidas en este bloque para dar contexto de gasto total
+                    const totalTodasPartidas=params.partidas.reduce((a,pt)=>{
+                      if(!pt.manual) return a; // auto: no calculable fácil aquí
+                      const b2=pt.bloques[bi];
+                      return b2?a+(pt.total*(b2.pct/100))/6:a;
+                    },0);
                     return(
                       <div key={bi} style={{display:"grid",gridTemplateColumns:"88px 1fr 68px 96px",
                         gap:8,alignItems:"center"}}>
@@ -886,12 +948,36 @@ function GastosPanel({params,setParams,nBloques}){
                           {fmt(blq.pct,1)}%
                         </span>
                         <span className="mono" style={{fontSize:10,color:G.textDim,textAlign:"right"}}>
-                          {fmtMM(montoBlq/6)}/mes
+                          {fmtMM(montoMes)}/mes
                         </span>
                       </div>
                     );
                   })}
                 </div>
+                {/* Totales por bloque sumando todas las partidas manuales */}
+                {params.partidas.some(pt=>pt.manual)&&(
+                  <div style={{marginTop:8,padding:"8px 10px",background:G.surfaceLight,borderRadius:7}}>
+                    <div style={{fontSize:9,color:G.textMuted,fontWeight:700,letterSpacing:".06em",textTransform:"uppercase",marginBottom:6}}>
+                      Gasto mensual total por bloque (suma todas las partidas manuales)
+                    </div>
+                    <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                      {Array.from({length:part.bloques.length},(_,bi)=>{
+                        const totalMes=params.partidas.reduce((a,pt)=>{
+                          if(!pt.manual) return a;
+                          const blq=pt.bloques[bi];
+                          return blq?a+(pt.total*(blq.pct/100))/6:a;
+                        },0);
+                        return totalMes>0?(
+                          <div key={bi} style={{padding:"4px 8px",background:`${part.color}15`,borderRadius:5,
+                            border:`1px solid ${part.color}30`}}>
+                            <div style={{fontSize:8,color:G.textMuted}}>B{bi+1} M{bi*6+1}-{(bi+1)*6}</div>
+                            <div className="mono" style={{fontSize:10,color:part.color,fontWeight:600}}>{fmtMM(totalMes)}/mes</div>
+                          </div>
+                        ):null;
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
             ):(
               <span style={{fontSize:11,color:G.textMuted,fontStyle:"italic"}}>
@@ -1198,28 +1284,47 @@ function ParamPanel({params,setParams,result}){
 
       {tab==="utilidades"&&(
         <div style={{display:"grid",gap:14}}>
-          <STitle color={G.gold}>Política de distribución de utilidades</STitle>
+          <STitle color={G.gold}>Distribución de utilidades</STitle>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
             <div>
               <Label>Reserva mínima (meses de gastos)</Label>
               <SmallNum value={params.reservaMinima} onChange={v=>upd("reservaMinima",v)} min={0} max={24}/>
             </div>
             <div>
-              <Label>Multiplicador base inicial (% del excedente)</Label>
+              <Label>Multiplicador base (% del excedente)</Label>
               <PctInput value={params.utilBaseMultiplier*100} onChange={v=>upd("utilBaseMultiplier",v/100)}/>
             </div>
             <div>
-              <Label>Factor de crecimiento mensual (×)</Label>
+              <Label>Factor crecimiento mensual (×)</Label>
               <SmallNum value={params.utilGrowthRate} onChange={v=>upd("utilGrowthRate",Math.max(1,v))} min={1} max={2} step={0.01}/>
             </div>
           </div>
-          <div style={{padding:14,background:G.goldDim,borderRadius:8,border:`1px solid ${G.gold}30`}}>
-            <div style={{fontSize:11,color:G.gold,fontWeight:700,marginBottom:6}}>📌 Cómo funciona la distribución</div>
+          <STitle color={G.red}>Morosidad y Cancelaciones</STitle>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
+            <div>
+              <Label>% Efectividad cobro mensualidades</Label>
+              <PctInput value={params.efectividadCobro} onChange={v=>upd("efectividadCobro",clamp(v,1,100))}/>
+              <div style={{fontSize:9,color:G.textMuted,marginTop:4}}>Morosidad mensual: {fmt(100-(params.efectividadCobro||85),1)}%</div>
+            </div>
+            <div>
+              <Label>Mes inicio cancelaciones</Label>
+              <SmallNum value={params.mesCancelacionInicio} onChange={v=>upd("mesCancelacionInicio",Math.max(1,v))} min={1} max={120}/>
+            </div>
+            <div>
+              <Label>Cancelaciones por mes (lotes)</Label>
+              <SmallNum value={params.cancelacionesPorMes} onChange={v=>upd("cancelacionesPorMes",Math.max(0,v))} min={0} max={50}/>
+              <div style={{fontSize:9,color:G.textMuted,marginTop:4}}>Lotes cancelados vuelven al inventario</div>
+            </div>
+          </div>
+          <div style={{padding:10,background:G.redDim,borderRadius:7,border:`1px solid ${G.red}20`,fontSize:11,color:G.textDim,lineHeight:1.7}}>
+            <strong style={{color:G.red}}>Modelo:</strong> desde mes {params.mesCancelacionInicio}, {params.cancelacionesPorMes} lote(s)/mes cancelan.
+            Se pierde el flujo de mensualidades futuras, pero el lote vuelve al inventario y se revende al precio vigente del cluster.
+          </div>
+          <div style={{padding:12,background:G.goldDim,borderRadius:8,border:`1px solid ${G.gold}30`}}>
+            <div style={{fontSize:11,color:G.gold,fontWeight:700,marginBottom:5}}>📌 Distribución de utilidades</div>
             <div style={{fontSize:11,color:G.textDim,lineHeight:1.8}}>
-              <strong>Condición de inicio:</strong> saldo &gt; reserva mínima Y mes &gt; 50% del periodo de ventas.<br/>
-              <strong>Mes 1 de utilidades:</strong> base = excedente × {pct(params.utilBaseMultiplier*100)}<br/>
-              <strong>Crecimiento:</strong> cada mes se multiplica por ×{params.utilGrowthRate} (exponencial)<br/>
-              <strong>Techo:</strong> nunca supera el excedente disponible sobre la reserva mínima.
+              <strong>Inicio:</strong> saldo &gt; reserva mínima Y mes &gt; 50% del periodo de ventas<br/>
+              <strong>Base:</strong> excedente × {pct(params.utilBaseMultiplier*100)} · <strong>Crecimiento:</strong> ×{params.utilGrowthRate}/mes
             </div>
           </div>
         </div>
@@ -1420,12 +1525,26 @@ function ScenarioView({label,color,params,ventasMes,onChangeVentas,result}){
         <div style={{display:"grid",gap:14,padding:"8px 0"}}>
           {/* Resumen rápido de totales */}
           <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+            {/* Alerta de obra */}
+            {result.flujoMensual.some(f=>f.alertaObra)&&(
+              <div style={{gridColumn:"1/-1",padding:"10px 14px",background:G.redDim,borderRadius:8,
+                border:`1px solid ${G.red}40`,display:"flex",alignItems:"center",gap:10}}>
+                <span style={{fontSize:16}}>⚠️</span>
+                <div>
+                  <div style={{fontSize:11,fontWeight:700,color:G.red}}>Alerta: flujo insuficiente para cubrir urbanización</div>
+                  <div style={{fontSize:10,color:G.textDim,marginTop:2}}>
+                    En {result.flujoMensual.filter(f=>f.alertaObra).length} mes(es) el saldo disponible no alcanza para el gasto de urbanización proyectado.
+                    Primeros meses críticos: {result.flujoMensual.filter(f=>f.alertaObra).slice(0,3).map(f=>`Mes ${f.mes}`).join(", ")}.
+                  </div>
+                </div>
+              </div>
+            )}
             {[
               {label:"Total ingresos",val:fmtMM(result.flujoMensual.reduce((a,f)=>a+f.ingresosBrutos,0)),color:G.accent},
               {label:"Total gastos",val:fmtMM(result.flujoMensual.reduce((a,f)=>a+f.totalGastosMes,0)),color:G.red},
               {label:"Utilidades distribuidas",val:fmtMM(result.flujoMensual.reduce((a,f)=>a+f.utilidadMes,0)),color:G.gold},
               {label:"Saldo final",val:fmtMM(result.flujoMensual[result.flujoMensual.length-1]?.saldo||0),color:G.blue},
-              {label:"Meses con ingresos",val:result.flujoMensual.filter(f=>f.ingresosBrutos>0).length+" meses",color:G.textDim},
+              {label:"Cancelaciones totales",val:fmt(result.flujoMensual.reduce((a,f)=>a+(f.cancelMes||0),0),0)+" lotes",color:G.red},
               {label:"Mes saldo máximo",val:"Mes "+(result.flujoMensual.reduce((mx,f)=>f.saldo>mx.saldo?f:mx,result.flujoMensual[0])?.mes||0),color:G.textDim},
             ].map(({label,val,color})=>(
               <div key={label} style={{padding:"10px 12px",background:G.surfaceLight,borderRadius:8}}>
@@ -1487,6 +1606,7 @@ function ScenarioView({label,color,params,ventasMes,onChangeVentas,result}){
                   <th style={{padding:"6px 10px",background:G.surfaceLight,color:G.text,fontSize:9,textAlign:"right"}}>Total lote</th>
                   <th style={{padding:"6px 10px",background:G.surfaceLight,color:G.accent,fontSize:9,textAlign:"right"}}>Enganche</th>
                   <th style={{padding:"6px 10px",background:G.surfaceLight,color:G.purple,fontSize:9,textAlign:"right"}}>Mensualidad</th>
+                  <th style={{padding:"6px 10px",background:G.surfaceLight,color:G.gold,fontSize:9,textAlign:"right"}}>Lotes est.</th>
                 </tr>
               </thead>
               <tbody>
@@ -1497,6 +1617,9 @@ function ScenarioView({label,color,params,ventasMes,onChangeVentas,result}){
                   const eng=total*(params.pctEnganche/100);
                   const mens=pl.meses>0?(total-eng)/pl.meses:0;
                   const isBase=pl.meses===params.plazoBase;
+                  // Lotes estimados vendidos con este plazo en este cluster
+                  const lotesCluster=Math.round(result.totalResid/params.numClusters);
+                  const lotesEst=Math.round(lotesCluster*(pl.pct/100));
                   return(
                     <tr key={pi} style={{background:isBase?G.goldDim:pi%2===0?`${G.surfaceLight}40`:"transparent"}}>
                       <td style={{padding:"6px 10px",color:isBase?G.gold:G.textDim,fontWeight:isBase?700:400}}>{pl.label}{isBase?" ★":""}</td>
@@ -1505,6 +1628,7 @@ function ScenarioView({label,color,params,ventasMes,onChangeVentas,result}){
                       <td style={{padding:"6px 10px",textAlign:"right",color:G.text}}>{fmtMM(total)}</td>
                       <td style={{padding:"6px 10px",textAlign:"right",color:G.accent}}>{fmtMM(eng)}</td>
                       <td style={{padding:"6px 10px",textAlign:"right",color:pl.meses>0?G.purple:G.textMuted}}>{pl.meses>0?fmtMM(mens):"CONTADO"}</td>
+                      <td style={{padding:"6px 10px",textAlign:"right",color:G.gold,fontWeight:600}}>{lotesEst}</td>
                     </tr>
                   );
                 })}
