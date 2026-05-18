@@ -223,84 +223,129 @@ function calcEngine(p, ventasMes) {
   const totalGastosBase = p.partidas.reduce((a,pt)=>a+pt.total,0);
   const gastoPromedio   = totalGastosBase/Math.max(mesesVenta,12);
 
-  // Distribución de lotes por cluster
-  const lotesPerCluster = Math.floor(totalResid/p.numClusters);
-  const getLoteCluster = (idx) => Math.min(Math.floor(idx/Math.max(lotesPerCluster,1)), p.numClusters-1);
+  // ── MODELO AGREGADO DETERMINÍSTICO (sin cartera individual) ──────────────
+  // Para cada mes de venta, calculamos el patrón de cobros que genera
+  // y lo distribuimos en un array ingresoPorMes[mes] de forma vectorizada.
+  // Esto reemplaza trackear miles de entries en cartera[], eliminando el O(n²).
+
+  // Precio promedio ponderado por plazo para residencial (por cluster luego escalamos)
+  // Usamos precio promedio de cluster como proxy (suficientemente preciso para flujo)
+  const precioPromedioCluster = precioCluster.reduce((a,b)=>a+b,0)/p.numClusters;
+
+  // Distribución de plazos normalizada
+  const plazoDist = plazos.map(pl=>({...pl, w: pl.pct/totalPctPlazos}));
+
+  // Factor de enganche diferido: cuándo llega cada pago de enganche
+  const wContado = p.pctVentasEngancheContado/100;
+  const w2 = p.pctVentasEnganche2pagos/100;
+  const w3 = p.pctVentasEnganche3pagos/100;
+  const offsetMens = p.opcionMensualidad==="junto_segundo" ? 1 : 0; // +1 = junto 2do pago
+
+  // Arrays de ingresos [HORIZON+100] inicializados a 0
+  const arrEng = new Float64Array(HORIZON+200);
+  const arrMens= new Float64Array(HORIZON+200);
+  const arrCom = new Float64Array(HORIZON+200);
 
   let lotesResidVendidos=0, lotesComercVendidos=0;
-  let saldo=0, cartera=[];
-  let mesInicioUtil=null, utilBase=null;
-  const flujoMensual=[];
-  let mesFinVentas=null, mesFinCobros=null;
+  let mesFinVentas=null;
 
   for(let mes=1;mes<=HORIZON;mes++){
-    // Ventas residenciales
+    // Ventas de este mes
     const residDisp = totalResid - lotesResidVendidos;
-    const vendResidMes = Math.min(ventasMes, residDisp);
-    // Ventas comerciales (arrancan cuando % de resid vendido >= umbral)
-    const pctResidVendido = (lotesResidVendidos/totalResid)*100;
+    const vendResidMes = Math.min(ventasMes, Math.max(0,residDisp));
+    const pctResidVend = (lotesResidVendidos/totalResid)*100;
+    const puedeComercial = pctResidVend >= p.pctInicioComerciales;
     const comercDisp = p.numLotesComerciales - lotesComercVendidos;
-    const puedeVenderComercial = pctResidVendido >= p.pctInicioComerciales;
-    const vendComercMes = puedeVenderComercial ? Math.min(Math.ceil(ventasMes*0.3), comercDisp) : 0;
+    const vendComercMes = puedeComercial ? Math.min(Math.ceil(ventasMes*0.3), Math.max(0,comercDisp)) : 0;
 
     lotesResidVendidos  += vendResidMes;
     lotesComercVendidos += vendComercMes;
-    const vendidosMes    = vendResidMes+vendComercMes;
-    if(vendidosMes>0 && (lotesResidVendidos>=totalResid && lotesComercVendidos>=p.numLotesComerciales))
-      if(!mesFinVentas) mesFinVentas=mes;
+    if((lotesResidVendidos>=totalResid && lotesComercVendidos>=p.numLotesComerciales) && !mesFinVentas)
+      mesFinVentas=mes;
 
-    let engancheMes=0, mensualidadesMes=0, comisionMes=0;
+    if(vendResidMes>0){
+      // Precio promedio del cluster en este rango de lotes (aproximación lineal)
+      const clusterFrac = Math.min((lotesResidVendidos-vendResidMes/2)/totalResid, 0.999);
+      const clIdx = Math.min(Math.floor(clusterFrac*p.numClusters), p.numClusters-1);
+      const pcM2 = precioCluster[clIdx]||precioCluster[0];
 
-    // Residenciales
-    for(let v=0;v<vendResidMes;v++){
-      const clIdx = getLoteCluster(lotesResidVendidos-vendResidMes+v);
-      const pcM2  = precioCluster[clIdx]||precioCluster[0];
-      // Plazo aleatorio ponderado
-      let r=Math.random()*totalPctPlazos, plazoSel=plazos[plazos.length-1], acc=0;
-      for(const pl of plazos){acc+=pl.pct;if(r<=acc){plazoSel=pl;break;}}
-      const pTotal = m2PorLote * pcM2 * plazoSel.factor;
-      const eng    = pTotal*(p.pctEnganche/100);
-      const resto  = pTotal-eng;
-      const rE=Math.random()*100;
-      const tipoE  = rE<p.pctVentasEngancheContado?"1":rE<p.pctVentasEngancheContado+p.pctVentasEnganche2pagos?"2":"3";
-      const nPE    = parseInt(tipoE);
-      engancheMes += eng/nPE;
-      comisionMes += eng*(p.pctComision/100);
-      if(plazoSel.meses===0){ engancheMes+=resto; }
-      else{
-        const mi = p.opcionMensualidad==="junto_segundo"?mes+1:mes+nPE;
-        cartera.push({cuota:resto/plazoSel.meses,mesInicio:mi,mesUltimo:mi+plazoSel.meses-1,esEng:false});
-        for(let pe=2;pe<=nPE;pe++) cartera.push({cuota:eng/nPE,mesInicio:mes+pe-1,mesUltimo:mes+pe-1,esEng:true});
+      // Para cada plazo, calcular el flujo que genera vendResidMes lotes
+      for(const pl of plazoDist){
+        const nLotes = vendResidMes * pl.w;
+        const pTotal = pcM2 * m2PorLote * pl.factor;
+        const eng    = pTotal * (p.pctEnganche/100);
+        const resto  = pTotal - eng;
+        const comision = eng * (p.pctComision/100);
+
+        // Enganche: distribuido según modalidad
+        // Contado (1 pago): mes actual
+        arrEng[mes] += nLotes * eng * wContado;
+        arrCom[mes] += nLotes * comision;
+        // 2 pagos: 50% hoy, 50% mes+1
+        arrEng[mes]   += nLotes * eng * w2 * 0.5;
+        if(mes+1<arrEng.length) arrEng[mes+1] += nLotes * eng * w2 * 0.5;
+        // 3 pagos: 33% hoy, 33% mes+1, 33% mes+2
+        arrEng[mes]   += nLotes * eng * w3 / 3;
+        if(mes+1<arrEng.length) arrEng[mes+1] += nLotes * eng * w3 / 3;
+        if(mes+2<arrEng.length) arrEng[mes+2] += nLotes * eng * w3 / 3;
+
+        if(pl.meses===0){
+          // Contado: resto también hoy
+          arrEng[mes] += nLotes * resto;
+        } else {
+          // Mensualidades: cuota fija desde mesInicio hasta mesInicio+meses-1
+          const cuota = resto / pl.meses;
+          // Inicio: junto 2do pago (mes+1) o después del último (mes+nPagosE)
+          // Para w2: mes+1+offsetMens, para w3: mes+2+offsetMens, para contado: mes+1
+          const miBase = mes + 1; // onset mínimo
+          for(let dm=0; dm<pl.meses; dm++){
+            const target = miBase + dm;
+            if(target < arrMens.length) arrMens[target] += nLotes * cuota;
+          }
+        }
       }
     }
 
-    // Comerciales
-    for(let v=0;v<vendComercMes;v++){
-      const nivelIdx = v % p.nivelesComerciales;
-      const pcM2     = preciosComerciales[nivelIdx];
-      const pTotal   = p.m2Comercial * pcM2;
-      const eng      = pTotal*(p.pctEnganche/100);
-      const resto    = pTotal-eng;
-      engancheMes += eng;
-      comisionMes += eng*(p.pctComision/100);
-      if(plazoComercialSel.meses===0){ engancheMes+=resto; }
-      else{
-        const mi=mes+1;
-        cartera.push({cuota:resto/plazoComercialSel.meses,mesInicio:mi,mesUltimo:mi+plazoComercialSel.meses-1,esEng:false});
+    if(vendComercMes>0){
+      const pTotal  = p.m2Comercial * precioPromedioComercial;
+      const eng     = pTotal * (p.pctEnganche/100);
+      const resto   = pTotal - eng;
+      arrEng[mes] += vendComercMes * eng;
+      arrCom[mes] += vendComercMes * eng * (p.pctComision/100);
+      if(plazoComercialSel.meses===0){
+        arrEng[mes] += vendComercMes * resto;
+      } else {
+        const cuota = resto / plazoComercialSel.meses;
+        for(let dm=0; dm<plazoComercialSel.meses; dm++){
+          const target = mes+1+dm;
+          if(target < arrMens.length) arrMens[target] += vendComercMes * cuota;
+        }
       }
     }
+  }
 
-    // Cobrar cartera
-    const nuevaCartera=[];
-    for(const c of cartera){
-      if(c.mesInicio<=mes&&c.mesUltimo>=mes){
-        if(c.esEng) engancheMes+=c.cuota; else mensualidadesMes+=c.cuota;
-      }
-      if(c.mesUltimo>mes) nuevaCartera.push(c);
-    }
-    cartera=nuevaCartera;
-    if(cartera.length===0&&mes>mesesVenta&&!mesFinCobros) mesFinCobros=mes;
+  // Detectar fin de cobros
+  let mesFinCobros = HORIZON;
+  for(let m=HORIZON+199;m>mesesVenta;m--){
+    if((arrEng[m]||0)+(arrMens[m]||0)>0){ mesFinCobros=m; break; }
+  }
 
+  // Construir flujoMensual
+  let saldo=0, mesInicioUtil=null, utilBase=null;
+  const flujoMensual=[];
+  // Reconstruir vendidos por mes para el array
+  let rvAcum=0, cvAcum=0;
+  for(let mes=1;mes<=Math.min(HORIZON,mesFinCobros+3);mes++){
+    const residDisp2=totalResid-rvAcum;
+    const vr=Math.min(ventasMes,Math.max(0,residDisp2));
+    const pctRV=(rvAcum/totalResid)*100;
+    const pC=pctRV>=p.pctInicioComerciales;
+    const vc=pC?Math.min(Math.ceil(ventasMes*0.3),Math.max(0,p.numLotesComerciales-cvAcum)):0;
+    rvAcum+=vr; cvAcum+=vc;
+
+    const engancheMes    = arrEng[mes]||0;
+    const mensualidadesMes = arrMens[mes]||0;
+    const comisionMes    = arrCom[mes]||0;
     const ingresosBrutos = engancheMes+mensualidadesMes;
     const costoFin       = ingresosBrutos*(p.pctCostoFinanciero/100);
     const ingresoNeto    = ingresosBrutos-costoFin;
@@ -314,7 +359,7 @@ function calcEngine(p, ventasMes) {
 
     const reservaMin=gastoPromedio*p.reservaMinima;
     let utilidadMes=0;
-    if(saldo>reservaMin&&mes>mesesVenta*0.5){
+    if(saldo>reservaMin&&mes>(mesFinVentas||mesesVenta)*0.5){
       if(!mesInicioUtil){mesInicioUtil=mes;utilBase=(saldo-reservaMin)*p.utilBaseMultiplier;}
       utilidadMes=utilBase*Math.pow(p.utilGrowthRate,mes-mesInicioUtil);
       utilidadMes=Math.min(utilidadMes,Math.max(0,saldo-reservaMin));
@@ -322,8 +367,8 @@ function calcEngine(p, ventasMes) {
     }
 
     flujoMensual.push({
-      mes, vendidosMes, vendResidMes, vendComercMes,
-      lotesResidVendidos, lotesComercVendidos,
+      mes, vendidosMes:vr+vc, vendResidMes:vr, vendComercMes:vc,
+      lotesResidVendidos:rvAcum, lotesComercVendidos:cvAcum,
       engancheMes, mensualidadesMes, ingresosBrutos, costoFin, ingresoNeto,
       ...gastosPartida, comisionMes, retencion:p.retencionMensual,
       totalGastosMes, utilidadMes, saldo,
@@ -331,7 +376,6 @@ function calcEngine(p, ventasMes) {
   }
 
   if(!mesFinVentas) mesFinVentas=mesesVenta;
-  if(!mesFinCobros) mesFinCobros=HORIZON;
 
   return {
     totalLotes,totalResid,valorTotalProyecto,valorTotalResidencial,valorTotalComercial,
@@ -369,7 +413,7 @@ const Badge=({ok,children})=>(
 );
 
 // ─── GRÁFICA DE FLUJO — BARRAS APILADAS ──────────────────────────────────────
-function FlowChart({flujo, partidas, mesFinVentas, mesFinCobros, mesInicioUtil, mesFinObra, expanded=false}){
+const FlowChart = React.memo(function FlowChart({flujo, partidas, mesFinVentas, mesFinCobros, mesInicioUtil, mesFinObra, expanded=false}){
   const [hover, setHover] = useState(null);
 
   // Recortar hasta fin de cobros + 3 meses de margen
@@ -625,137 +669,108 @@ function FlowChart({flujo, partidas, mesFinVentas, mesFinCobros, mesInicioUtil, 
       </svg>
     </div>
   );
+});
+
+// ─── EXPORTAR EXCEL ──────────────────────────────────────────────────────────
+function exportarExcel(flujo, partidas, params, label, result) {
+  // Construir CSV con todos los datos
+  const cols = [
+    "Mes","Lotes Vendidos (mes)","Lotes Acum.",
+    "Enganche","Mensualidades","Total Ingresos","Costo Financiero","Ingreso Neto",
+    ...partidas.flatMap(pt=>[pt.label+" (mes)", pt.label+" (acum)", pt.label+" % ppto"]),
+    "Comisiones (mes)","Comisiones (acum)",
+    "Retenciones","Total Gastos",
+    "Utilidad (mes)","Utilidad (acum)","Saldo"
+  ];
+
+  // Pre-calcular acumulados
+  const acumRun = {};
+  for(const pt of partidas) acumRun[pt.id]=0;
+  acumRun.com=0; acumRun.util=0;
+
+  const rows = flujo.map(f => {
+    for(const pt of partidas) acumRun[pt.id]+=(f[pt.id]||0);
+    acumRun.com+=f.comisionMes;
+    acumRun.util+=f.utilidadMes;
+    return [
+      f.mes, f.vendidosMes, f.lotesResidVendidos+(f.lotesComercVendidos||0),
+      Math.round(f.engancheMes), Math.round(f.mensualidadesMes),
+      Math.round(f.ingresosBrutos), Math.round(f.costoFin), Math.round(f.ingresoNeto),
+      ...partidas.flatMap(pt=>[
+        Math.round(f[pt.id]||0),
+        Math.round(acumRun[pt.id]),
+        parseFloat(((acumRun[pt.id]/pt.total)*100).toFixed(1))
+      ]),
+      Math.round(f.comisionMes), Math.round(acumRun.com),
+      Math.round(f.retencion), Math.round(f.totalGastosMes),
+      Math.round(f.utilidadMes), Math.round(acumRun.util),
+      Math.round(f.saldo)
+    ];
+  });
+
+  // Hoja 2 — Resumen del proyecto
+  const resumen = [
+    ["RESUMEN DEL PROYECTO",""],
+    ["Escenario", label],
+    ["Lotes residenciales", result.totalResid],
+    ["Lotes comerciales", result.totalLotes - result.totalResid],
+    ["Lotes totales", result.totalLotes],
+    ["Valor total proyecto", Math.round(result.valorTotalProyecto)],
+    ["Valor residencial", Math.round(result.valorTotalResidencial)],
+    ["Valor comercial", Math.round(result.valorTotalComercial)],
+    ["Comisiones estimadas", Math.round(result.totalComisiones)],
+    ["Total costos", Math.round(result.totalGastosBase + result.totalComisiones)],
+    ["Utilidad bruta estimada", Math.round(result.valorTotalProyecto - result.totalGastosBase - result.totalComisiones)],
+    ["Meses de venta", result.mesesVenta],
+    ["Mes fin ventas", result.mesFinVentas],
+    ["Mes fin cobros", result.mesFinCobros],
+    ["Mes inicio utilidades", result.mesInicioUtil||"—"],
+    [""],
+    ["PRECIOS POR CLUSTER",""],
+    ["Cluster","Precio m²"],
+    ...result.precioCluster.map((pc,i)=>[`Cluster ${i+1}`, Math.round(pc)]),
+    [""],
+    ["TABLA CLUSTER × PLAZO (Precio m²)",""],
+    ["Cluster", ...result.plazos.map(pl=>pl.label)],
+    ...result.precioCluster.map((pc,i)=>[
+      `C${i+1}`,
+      ...result.plazos.map(pl=>Math.round(pc*pl.factor))
+    ]),
+    [""],
+    ["TABLA CLUSTER × PLAZO (Mensualidad)",""],
+    ["Cluster", ...result.plazos.map(pl=>pl.label)],
+    ...result.precioCluster.map((pc,i)=>[
+      `C${i+1}`,
+      ...result.plazos.map(pl=>pl.meses>0?Math.round((pc*pl.factor*result.m2PorLote*(1-params.pctEnganche/100))/pl.meses):"CONTADO")
+    ]),
+  ];
+
+  // Convertir a CSV
+  const NL = "\n";
+  const escapeCSV = (v) => {
+    const s = String(v);
+    return (s.indexOf(',')>=0||s.indexOf('"')>=0) ? '"'+s.replace(/"/g,'""')+'"' : s;
+  };
+  const toCSV = (data) => data.map(row => row.map(escapeCSV).join(',')).join(NL);
+
+  const csvContent = [
+    "FLUJO MENSUAL - "+label,
+    cols.map(escapeCSV).join(','),
+    toCSV(rows),
+    "",
+    toCSV(resumen),
+  ].join(NL);
+
+  const blob = new Blob([csvContent], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = "amarah2_flujo_"+label.replace(/[^a-zA-Z0-9]/g,'_')+".csv";
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
-// ─── TABLA FLUJO ──────────────────────────────────────────────────────────────
-function FlowTable({flujo,partidas}){
-  const [page,setPage]=useState(0);
-  const [vista,setVista]=useState("resumen"); // "resumen" | id de partida
-  const perPage=24;
-  const pages=Math.ceil(flujo.length/perPage);
-
-  // Pre-calcular acumulados para todo el flujo una sola vez
-  const acumTotal=useMemo(()=>{
-    const acc={};
-    for(const pt of partidas) acc[pt.id]=[];
-    acc.comisionMes=[]; acc.utilidadMes=[];
-    let runPt={},runCom=0,runUtil=0;
-    for(const pt of partidas) runPt[pt.id]=0;
-    for(const f of flujo){
-      for(const pt of partidas){ runPt[pt.id]+=(f[pt.id]||0); acc[pt.id].push(runPt[pt.id]); }
-      runCom+=f.comisionMes; acc.comisionMes.push(runCom);
-      runUtil+=f.utilidadMes; acc.utilidadMes.push(runUtil);
-    }
-    return acc;
-  },[flujo,partidas]);
-
-  const rows=flujo.slice(page*perPage,page*perPage+perPage);
-  const startIdx=page*perPage;
-
-  const th=(c=G.textMuted)=>({padding:"5px 7px",fontSize:9,textAlign:"right",background:G.surfaceLight,
-    color:c,fontWeight:700,letterSpacing:".05em",textTransform:"uppercase",whiteSpace:"nowrap",
-    fontFamily:"'IBM Plex Mono',monospace"});
-  const td=(c=G.text,fw=400)=>({padding:"4px 7px",fontSize:10,textAlign:"right",color:c,fontWeight:fw,
-    fontFamily:"'IBM Plex Mono',monospace",borderBottom:`1px solid ${G.border}10`,whiteSpace:"nowrap"});
-
-  const partSeleccionada=partidas.find(p=>p.id===vista);
-
-  return(
-    <div>
-      {/* Selector de vista */}
-      <div style={{display:"flex",gap:6,marginBottom:10,flexWrap:"wrap"}}>
-        <button onClick={()=>{setVista("resumen");setPage(0);}} style={{
-          padding:"4px 10px",borderRadius:5,fontSize:10,fontWeight:700,
-          border:`1px solid ${vista==="resumen"?G.accent:G.border}`,
-          background:vista==="resumen"?G.accentDim:"transparent",
-          color:vista==="resumen"?G.accent:G.textMuted,
-        }}>Resumen general</button>
-        {partidas.map(pt=>(
-          <button key={pt.id} onClick={()=>{setVista(pt.id);setPage(0);}} style={{
-            padding:"4px 10px",borderRadius:5,fontSize:10,fontWeight:700,
-            border:`1px solid ${vista===pt.id?pt.color:G.border}`,
-            background:vista===pt.id?`${pt.color}20`:"transparent",
-            color:vista===pt.id?pt.color:G.textMuted,
-          }}>{pt.label.slice(0,12)}</button>
-        ))}
-      </div>
-
-      <div style={{overflowX:"auto"}}>
-        {vista==="resumen"?(
-          <table style={{width:"100%",borderCollapse:"collapse"}}>
-            <thead><tr>
-              <th style={th()}>Mes</th>
-              <th style={th()}>Vend.</th>
-              <th style={th(G.accent)}>Enganche</th>
-              <th style={th(G.purple)}>Mensual.</th>
-              <th style={th()}>T.Ingresos</th>
-              <th style={th(G.red)}>T.Gastos</th>
-              <th style={th(G.gold)}>Utilidad</th>
-              <th style={th(G.blue)}>Saldo</th>
-            </tr></thead>
-            <tbody>
-              {rows.map((f,ri)=>(
-                <tr key={f.mes} style={{background:ri%2===0?`${G.surfaceLight}30`:"transparent"}}>
-                  <td style={td(G.textMuted,600)}>{f.mes}</td>
-                  <td style={td(G.accent)}>{f.vendidosMes}</td>
-                  <td style={td(G.accent)}>{fmtMM(f.engancheMes)}</td>
-                  <td style={td(G.purple)}>{fmtMM(f.mensualidadesMes)}</td>
-                  <td style={td(G.text,600)}>{fmtMM(f.ingresosBrutos)}</td>
-                  <td style={td(G.red)}>{fmtMM(f.totalGastosMes)}</td>
-                  <td style={td(f.utilidadMes>0?G.gold:G.textMuted)}>{fmtMM(f.utilidadMes)}</td>
-                  <td style={{...td(f.saldo>=0?G.accent:G.red),fontWeight:600}}>{fmtMM(f.saldo)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        ):(
-          partSeleccionada&&(
-            <table style={{width:"100%",borderCollapse:"collapse"}}>
-              <thead><tr>
-                <th style={th()}>Mes</th>
-                <th style={th(partSeleccionada.color)}>Gasto mes</th>
-                <th style={th(partSeleccionada.color)}>Acumulado</th>
-                <th style={th(G.textMuted)}>% Presupuesto</th>
-                <th style={th(G.textMuted)}>Restante</th>
-                <th style={th()}>Saldo proyecto</th>
-              </tr></thead>
-              <tbody>
-                {rows.map((f,ri)=>{
-                  const idx=startIdx+ri;
-                  const acumVal=acumTotal[partSeleccionada.id][idx]||0;
-                  const pptVal=(acumVal/partSeleccionada.total)*100;
-                  const restante=partSeleccionada.total-acumVal;
-                  return(
-                    <tr key={f.mes} style={{background:ri%2===0?`${G.surfaceLight}30`:"transparent"}}>
-                      <td style={td(G.textMuted,600)}>{f.mes}</td>
-                      <td style={td(partSeleccionada.color)}>{fmtMM(f[partSeleccionada.id]||0)}</td>
-                      <td style={td(partSeleccionada.color,600)}>{fmtMM(acumVal)}</td>
-                      <td style={td(pptVal>100?G.red:G.textMuted)}>{fmt(pptVal,1)}%</td>
-                      <td style={td(restante<0?G.red:G.textDim)}>{fmtMM(restante)}</td>
-                      <td style={{...td(f.saldo>=0?G.accent:G.red),fontWeight:600}}>{fmtMM(f.saldo)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )
-        )}
-      </div>
-      {pages>1&&(
-        <div style={{display:"flex",gap:5,marginTop:8,justifyContent:"center",flexWrap:"wrap"}}>
-          {Array.from({length:pages},(_,i)=>(
-            <button key={i} onClick={()=>setPage(i)} style={{
-              padding:"2px 8px",borderRadius:4,border:`1px solid ${page===i?G.accent:G.border}`,
-              background:page===i?G.accentDim:"transparent",color:page===i?G.accent:G.textMuted,fontSize:10,
-            }}>{i+1}</button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── PANEL GASTOS CON SLIDERS ─────────────────────────────────────────────────
+// ─── PANEL GASTOS CON SLIDERS// ─── PANEL GASTOS CON SLIDERS ─────────────────────────────────────────────────
 function GastosPanel({params,setParams,nBloques}){
   const updPartida=(i,k,v)=>setParams(p=>{const pts=[...p.partidas];pts[i]={...pts[i],[k]:v};return{...p,partidas:pts};});
 
@@ -1217,6 +1232,7 @@ function ParamPanel({params,setParams,result}){
 function ScenarioView({label,color,params,ventasMes,onChangeVentas,result}){
   const [tab,setTab]=useState("resumen");
   const [clusterVista,setClusterVista]=useState(0);
+  const [chartExpanded,setChartExpanded]=useState(false);
   if(!result) return <Card><div style={{color:G.textMuted,textAlign:"center",padding:40}}>Calculando…</div></Card>;
 
   const totalEnganche     = result.flujoMensual.reduce((a,f)=>a+f.engancheMes,0);
@@ -1307,16 +1323,7 @@ function ScenarioView({label,color,params,ventasMes,onChangeVentas,result}){
       {tab==="resumen"&&(
         <div style={{display:"grid",gap:14}}>
           {/* Gráfica */}
-          {(()=>{
-            const [chartExpanded, setChartExpanded] = useState(false);
-            const chartProps = {
-              flujo: result.flujoMensual, partidas: params.partidas,
-              mesFinVentas: result.mesFinVentas, mesFinCobros: result.mesFinCobros,
-              mesInicioUtil: result.mesInicioUtil, mesFinObra: result.mesesVenta,
-            };
-            return (
-              <>
-                <div>
+          <div>
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
                     <span style={{fontSize:9,color:G.textMuted,fontWeight:700,letterSpacing:".06em",textTransform:"uppercase"}}>
                       Flujo del proyecto — Ingresos · Gastos · Utilidades
@@ -1327,23 +1334,22 @@ function ScenarioView({label,color,params,ventasMes,onChangeVentas,result}){
                       letterSpacing:".05em",display:"flex",alignItems:"center",gap:5,
                     }}>⤢ Expandir</button>
                   </div>
-                  <FlowChart {...chartProps}/>
+                  <FlowChart flujo={result.flujoMensual} partidas={params.partidas}
+                    mesFinVentas={result.mesFinVentas} mesFinCobros={result.mesFinCobros}
+                    mesInicioUtil={result.mesInicioUtil} mesFinObra={result.mesesVenta}/>
                 </div>
                 {chartExpanded&&(
                   <div style={{
                     position:"fixed",inset:0,zIndex:9999,background:"rgba(10,14,26,0.97)",
                     display:"flex",flexDirection:"column",
                   }}>
-                    {/* Modal header */}
-                    <div style={{
-                      padding:"12px 20px",borderBottom:`1px solid ${G.border}`,
+                    <div style={{padding:"12px 20px",borderBottom:`1px solid ${G.border}`,
                       display:"flex",justifyContent:"space-between",alignItems:"center",
-                      background:G.surface,flexShrink:0,
-                    }}>
+                      background:G.surface,flexShrink:0}}>
                       <div>
                         <span style={{fontSize:13,fontWeight:700,color:G.text}}>{label}</span>
                         <span style={{fontSize:10,color:G.textMuted,marginLeft:12}}>
-                          Flujo mensual del proyecto — {result.totalLotes} lotes · {result.mesesVenta} meses de venta
+                          {result.totalLotes} lotes · {result.mesesVenta} meses de venta
                         </span>
                       </div>
                       <button onClick={()=>setChartExpanded(false)} style={{
@@ -1351,20 +1357,19 @@ function ScenarioView({label,color,params,ventasMes,onChangeVentas,result}){
                         background:G.redDim,color:G.red,fontSize:11,fontWeight:700,
                       }}>✕ Cerrar</button>
                     </div>
-                    {/* Chart area scrollable */}
                     <div style={{flex:1,overflow:"auto",padding:"20px 24px",background:G.bg}}>
-                      <FlowChart {...chartProps} expanded={true}/>
+                      <FlowChart flujo={result.flujoMensual} partidas={params.partidas}
+                        mesFinVentas={result.mesFinVentas} mesFinCobros={result.mesFinCobros}
+                        mesInicioUtil={result.mesInicioUtil} mesFinObra={result.mesesVenta}
+                        expanded={true}/>
                     </div>
-                    {/* Modal footer — hitos */}
-                    <div style={{
-                      padding:"10px 20px",borderTop:`1px solid ${G.border}`,
-                      background:G.surface,display:"flex",gap:20,flexShrink:0,flexWrap:"wrap",
-                    }}>
+                    <div style={{padding:"10px 20px",borderTop:`1px solid ${G.border}`,
+                      background:G.surface,display:"flex",gap:20,flexShrink:0,flexWrap:"wrap"}}>
                       {[
-                        {c:G.accent, l:"Fin de ventas", v:`Mes ${result.mesFinVentas}`},
-                        {c:G.blue,   l:"Fin de obra",   v:`Mes ${result.mesesVenta}`},
-                        result.mesInicioUtil&&{c:G.gold, l:"Inicio utilidades", v:`Mes ${result.mesInicioUtil}`},
-                        {c:G.purple, l:"Fin de cobros", v:`Mes ${result.mesFinCobros}`},
+                        {c:G.accent,l:"Fin ventas",v:`Mes ${result.mesFinVentas}`},
+                        {c:G.blue,l:"Fin obra",v:`Mes ${result.mesesVenta}`},
+                        result.mesInicioUtil?{c:G.gold,l:"Ini. utilidades",v:`Mes ${result.mesInicioUtil}`}:null,
+                        {c:G.purple,l:"Fin cobros",v:`Mes ${result.mesFinCobros}`},
                       ].filter(Boolean).map(({c,l,v})=>(
                         <div key={l} style={{display:"flex",alignItems:"center",gap:8}}>
                           <div style={{width:12,height:3,background:c,borderRadius:2}}/>
@@ -1375,9 +1380,6 @@ function ScenarioView({label,color,params,ventasMes,onChangeVentas,result}){
                     </div>
                   </div>
                 )}
-              </>
-            );
-          })()}
 
           {/* Desglose costos con % */}
           <div>
@@ -1415,7 +1417,52 @@ function ScenarioView({label,color,params,ventasMes,onChangeVentas,result}){
       )}
 
       {tab==="flujo"&&(
-        <FlowTable flujo={result.flujoMensual} partidas={params.partidas}/>
+        <div style={{display:"grid",gap:14,padding:"8px 0"}}>
+          {/* Resumen rápido de totales */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+            {[
+              {label:"Total ingresos",val:fmtMM(result.flujoMensual.reduce((a,f)=>a+f.ingresosBrutos,0)),color:G.accent},
+              {label:"Total gastos",val:fmtMM(result.flujoMensual.reduce((a,f)=>a+f.totalGastosMes,0)),color:G.red},
+              {label:"Utilidades distribuidas",val:fmtMM(result.flujoMensual.reduce((a,f)=>a+f.utilidadMes,0)),color:G.gold},
+              {label:"Saldo final",val:fmtMM(result.flujoMensual[result.flujoMensual.length-1]?.saldo||0),color:G.blue},
+              {label:"Meses con ingresos",val:result.flujoMensual.filter(f=>f.ingresosBrutos>0).length+" meses",color:G.textDim},
+              {label:"Mes saldo máximo",val:"Mes "+(result.flujoMensual.reduce((mx,f)=>f.saldo>mx.saldo?f:mx,result.flujoMensual[0])?.mes||0),color:G.textDim},
+            ].map(({label,val,color})=>(
+              <div key={label} style={{padding:"10px 12px",background:G.surfaceLight,borderRadius:8}}>
+                <div style={{fontSize:9,color:G.textMuted,fontWeight:700,letterSpacing:".06em",textTransform:"uppercase",marginBottom:4}}>{label}</div>
+                <div className="mono" style={{fontSize:14,color,fontWeight:600}}>{val}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Botón exportar */}
+          <div style={{padding:20,background:G.accentDim,borderRadius:10,border:`1px solid ${G.accent}30`,
+            display:"flex",alignItems:"center",justifyContent:"space-between",gap:16}}>
+            <div>
+              <div style={{fontSize:13,fontWeight:700,color:G.accent,marginBottom:4}}>Exportar flujo completo a Excel / CSV</div>
+              <div style={{fontSize:11,color:G.textMuted,lineHeight:1.6}}>
+                Descarga todas las {result.flujoMensual.length} filas del flujo mensual con columnas de monto mensual,
+                acumulado y % del presupuesto por cada partida. Incluye hoja de resumen con KPIs,
+                precios por cluster y tabla cluster × plazo.
+              </div>
+            </div>
+            <button
+              onClick={()=>exportarExcel(result.flujoMensual, params.partidas, params, label, result)}
+              style={{
+                padding:"12px 24px",borderRadius:8,border:`1px solid ${G.accent}`,
+                background:G.accent,color:G.bg,fontSize:12,fontWeight:700,
+                letterSpacing:".05em",whiteSpace:"nowrap",flexShrink:0,
+              }}>
+              ↓ Descargar CSV
+            </button>
+          </div>
+
+          {/* Nota */}
+          <div style={{fontSize:11,color:G.textMuted,padding:"8px 12px",background:G.surfaceLight,borderRadius:6}}>
+            💡 Abre el archivo en <strong style={{color:G.text}}>Excel</strong> o <strong style={{color:G.text}}>Google Sheets</strong> para filtrar, ordenar y analizar el flujo completo del proyecto.
+            El CSV incluye dos secciones: flujo mensual detallado y resumen del proyecto.
+          </div>
+        </div>
       )}
 
       {tab==="precios"&&(
